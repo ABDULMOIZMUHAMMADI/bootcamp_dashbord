@@ -277,23 +277,23 @@ if panel == "Admin":
                 roll = n.get("studentRollNo", "")
                 dom  = n.get("domainName", "")
                 asgn = n.get("assignmentTitle", "Assignment")
-                    ts   = n.get("createdAt", {})
-                    if isinstance(ts, dict): ts = ts.get("$date", "")
-                    
-                    st.markdown(f"""<div class='notif-box'>
-                        <div class='notif-title'> Missed Submission</div>
-                        {msg}<br>
-                        <span class='chip chip-gray'>Roll #{roll}</span>
-                        <span class='chip chip-blue'>{dom}</span>
-                        <span class='chip chip-orange'>{asgn}</span>
-                        <span style='font-size:0.7rem;color:#94a3b8;'>{str(ts)[:19]}</span>
-                    </div>""", unsafe_allow_html=True)
-                    
-                    notif_id = n.get("_id", {}).get("$oid") if isinstance(n.get("_id"), dict) else str(n.get("_id", ""))
-                    if st.button("Mark as Read", key=f"mark_admin_{notif_id}"):
-                        _, derr = delete(f"/notifications/{notif_id}")
-                        if derr: err(derr)
-                        else: st.rerun()
+                ts   = n.get("createdAt", {})
+                if isinstance(ts, dict): ts = ts.get("$date", "")
+                
+                st.markdown(f"""<div class='notif-box'>
+                    <div class='notif-title'> Missed Submission</div>
+                    {msg}<br>
+                    <span class='chip chip-gray'>Roll #{roll}</span>
+                    <span class='chip chip-blue'>{dom}</span>
+                    <span class='chip chip-orange'>{asgn}</span>
+                    <span style='font-size:0.7rem;color:#94a3b8;'>{str(ts)[:19]}</span>
+                </div>""", unsafe_allow_html=True)
+                
+                notif_id = n.get("_id", {}).get("$oid") if isinstance(n.get("_id"), dict) else str(n.get("_id", ""))
+                if st.button("Mark as Read", key=f"mark_admin_{notif_id}"):
+                    _, derr = delete(f"/notifications/{notif_id}")
+                    if derr: err(derr)
+                    else: st.rerun()
         st.markdown("")
 
     # ──────────────────────────────────────────
