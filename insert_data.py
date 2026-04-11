@@ -74,3 +74,28 @@
 #     print(f"{len(attendance_records)} attendance records inserted ✅")
 # else:
 #     print("No data inserted ❌")
+
+# from bson import ObjectId
+
+# bootcamp_id = ObjectId("69c61d776de2bafc381e9dd1")
+
+# domains = list(db.domains.find({"bootcamp": bootcamp_id}))
+# students = list(db.users.find({"studentBootcampId": bootcamp_id}))
+
+# index = 0
+
+# for domain in domains:
+#     assigned_students = students[index:index+2]
+
+#     for student in assigned_students:
+#         db.users.update_one(
+#             {"_id": student["_id"]},
+#             {"$set": {"domainId": domain["_id"]}}
+#         )
+
+#     db.domains.update_one(
+#         {"_id": domain["_id"]},
+#         {"$set": {"studentsCount": len(assigned_students)}}
+#     )
+
+#     index += 2

@@ -1,47 +1,33 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from pymongo import MongoClient
 from bson import ObjectId, json_util
 import json
-from datetime import datetime, UTC
+import os
+from datetime import datetime, timezone
+from dotenv import load_dotenv
 
 from scraper import get_content
 from similarity import get_similarity
 
 # ─────────────────────────────────────────────
-# DB CONNECTION (inline so no import side effects)
+# DB CONNECTION
 # ─────────────────────────────────────────────
-MONGO_URL = "mongodb+srv://user:uS3er2060@bootcamptracker.roknckd.mongodb.net/"
+load_dotenv()
+MONGO_URL = os.getenv("MONGO_URL")
 client = MongoClient(MONGO_URL)
 db = client["test"]
 
-users_collection        = db["users"]
-domains_collection      = db["domains"]
-assignments_collection  = db["assignments"]
-student_assignments     = db["student_assignments"]
-notifications_col       = db["notifications"]
+users_collection       = db["users"]
+domains_collection     = db["domains"]
+bootcamps_collection   = db["bootcamps"]
+assignments_collection = db["assignments"]
+student_assignments    = db["student_assignments"]
+notifications_col      = db["notifications"]
+attendance_collection  = db["attendance"]
 
-# ─────────────────────────────────────────────
-# STATIC CONFIG  (matches database.py)
-# ─────────────────────────────────────────────
-BOOTCAMPS = [
-    {"id": "69c538969d2f7dcce6f2df20", "name": "Bootcamp 4.0"},
-    {"id": "69c63a4736adc54470ff7703", "name": "Bootcamp 3.0"},
-    {"id": "69c63a5336adc54470ff7704", "name": "Bootcamp 2.0"},
-]
-
-DOMAINS = [
-    {"id": "69c538969d2f7dcce6f2df24", "name": "Web Development",  "teacherId": "69c63afa36adc54470ff7707"},
-    {"id": "69c538969d2f7dcce6f2df26", "name": "AI Engineering",   "teacherId": "69c63b6f36adc54470ff7708"},
-    {"id": "69c53f3b0b619312a3c67d7c", "name": "UI UX",            "teacherId": "69c63b9436adc54470ff7709"},
-]
-
-DOMAIN_ID_TO_NAME   = {d["id"]: d["name"]       for d in DOMAINS}
-DOMAIN_ID_TO_TEACHER= {d["id"]: d["teacherId"]  for d in DOMAINS}
-BOOTCAMP_ID_TO_NAME = {b["id"]: b["name"]        for b in BOOTCAMPS}
-
-# ─────────────────────────────────────────────
 app = FastAPI(title="Bootcamp Tracker API")
+
 
 # ═══════════════════════════════════════════════
 # HELPERS
@@ -53,26 +39,66 @@ def safe_oid(oid_str: str) -> ObjectId:
     except Exception:
         raise HTTPException(status_code=400, detail=f"Invalid ObjectId: {oid_str}")
 
+def flex_id(value: str) -> dict:
+    """
+    Returns a $in query that matches the field whether it was stored
+    as a plain string OR as an ObjectId. Solves the most common
+    'students not found' bug caused by inconsistent ID types in MongoDB.
+    Example: flex_id("abc123") → {"$in": ["abc123", ObjectId("abc123")]}
+    """
+    try:
+        return {"$in": [value, ObjectId(value)]}
+    except Exception:
+        return value
+
 def to_json(data):
     return json.loads(json_util.dumps(data))
 
-def student_by_roll(roll_no: int):
-    """Return student doc by rollNo."""
+def utcnow() -> datetime:
+    """Always return timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+def get_all_domains() -> list[dict]:
+    """Fetch all domains from DB (never hardcoded)."""
+    return list(domains_collection.find())
+
+def get_all_bootcamps() -> list[dict]:
+    """Fetch all bootcamps from DB (never hardcoded)."""
+    return list(bootcamps_collection.find())
+
+def build_domain_maps() -> tuple[dict, dict]:
+    """Returns (id→name, id→teacherId) for all domains."""
+    domains = get_all_domains()
+    id_to_name    = {str(d["_id"]): d.get("name", "") for d in domains}
+    id_to_teacher = {str(d["_id"]): str(d.get("teacherId", "")) for d in domains}
+    return id_to_name, id_to_teacher
+
+def build_bootcamp_map() -> dict:
+    """Returns id→name for all bootcamps."""
+    bootcamps = get_all_bootcamps()
+    return {str(b["_id"]): b.get("name", "") for b in bootcamps}
+
+def student_by_roll(roll_no: int) -> dict:
     student = users_collection.find_one({"rollNo": roll_no, "role": "student"})
     if not student:
         raise HTTPException(status_code=404, detail=f"No student with roll number {roll_no}")
     return student
 
 def enrich_student(s: dict) -> dict:
-    """Add human-readable bootcamp / domain / teacher names to a student doc."""
-    domain_id   = s.get("domainId", "")
-    bootcamp_id = s.get("studentBootcampId", "")
-    s["domainName"]   = DOMAIN_ID_TO_NAME.get(domain_id, domain_id)
-    s["bootcampName"] = BOOTCAMP_ID_TO_NAME.get(bootcamp_id, bootcamp_id)
-    s["teacherId"]    = DOMAIN_ID_TO_TEACHER.get(domain_id, "")
-    # look up teacher name from DB
-    teacher = users_collection.find_one({"_id": safe_oid(s["teacherId"])}) if s["teacherId"] else None
-    s["teacherName"]  = teacher.get("name", s["teacherId"]) if teacher else s["teacherId"]
+    """Add human-readable bootcamp / domain / teacher names — always from DB."""
+    domain_id_to_name, domain_id_to_teacher = build_domain_maps()
+    bootcamp_id_to_name = build_bootcamp_map()
+
+    domain_id   = str(s.get("domainId", ""))
+    bootcamp_id = str(s.get("studentBootcampId", ""))
+
+    s["domainName"]   = domain_id_to_name.get(domain_id, domain_id)
+    s["bootcampName"] = bootcamp_id_to_name.get(bootcamp_id, bootcamp_id)
+    teacher_id        = domain_id_to_teacher.get(domain_id, "")
+    s["teacherId"]    = teacher_id
+
+    teacher = users_collection.find_one({"_id": safe_oid(teacher_id)}) if teacher_id else None
+    s["teacherName"] = teacher.get("name", teacher_id) if teacher else teacher_id
     return s
 
 
@@ -88,32 +114,30 @@ def total_students():
 
 @app.get("/student/roll/{roll_no}")
 def get_student_by_roll(roll_no: int):
-    """Get student details by roll number."""
     s = student_by_roll(roll_no)
-    s = enrich_student(s)
-    return to_json(s)
+    return to_json(enrich_student(s))
 
 
 @app.get("/student/id/{student_id}")
 def get_student_by_id(student_id: str):
-    """Get student details by ObjectId string."""
     s = users_collection.find_one({"_id": safe_oid(student_id), "role": "student"})
     if not s:
         raise HTTPException(status_code=404, detail="Student not found")
-    s = enrich_student(s)
-    return to_json(s)
+    return to_json(enrich_student(s))
 
 
 @app.get("/students/bootcamp/{bootcamp_id}")
 def students_by_bootcamp(bootcamp_id: str):
-    students = list(users_collection.find({"studentBootcampId": bootcamp_id, "role": "student"}))
-    return {"count": len(students), "data": to_json(students)}
+    students = list(users_collection.find({"studentBootcampId": flex_id(bootcamp_id), "role": "student"}))
+    enriched = [enrich_student(s) for s in students]
+    return {"count": len(enriched), "data": to_json(enriched)}
 
 
 @app.get("/students/domain/{domain_id}")
 def students_by_domain(domain_id: str):
-    students = list(users_collection.find({"domainId": domain_id, "role": "student"}))
-    return {"count": len(students), "data": to_json(students)}
+    students = list(users_collection.find({"domainId": flex_id(domain_id), "role": "student"}))
+    enriched = [enrich_student(s) for s in students]
+    return {"count": len(enriched), "data": to_json(enriched)}
 
 
 # ═══════════════════════════════════════════════
@@ -122,31 +146,46 @@ def students_by_domain(domain_id: str):
 
 @app.get("/stats/bootcamp/{bootcamp_id}")
 def bootcamp_stats(bootcamp_id: str):
+    domain_id_to_name, _ = build_domain_maps()
+    bootcamp_id_to_name  = build_bootcamp_map()
+
     pipeline = [
-        {"$match": {"role": "student", "studentBootcampId": bootcamp_id}},
+        {"$match": {"role": "student", "studentBootcampId": flex_id(bootcamp_id)}},
         {"$group": {"_id": "$domainId", "count": {"$sum": 1}}}
     ]
     domain_data = list(users_collection.aggregate(pipeline))
     total = sum(d["count"] for d in domain_data)
-    # add domain names
     for d in domain_data:
-        d["domainName"] = DOMAIN_ID_TO_NAME.get(d["_id"], d["_id"])
-    return {"bootcamp_id": bootcamp_id, "bootcamp_name": BOOTCAMP_ID_TO_NAME.get(bootcamp_id, bootcamp_id),
-            "total_students": total, "domains": to_json(domain_data)}
+        d["domainName"] = domain_id_to_name.get(str(d["_id"]), str(d["_id"]))
+
+    return {
+        "bootcamp_id": bootcamp_id,
+        "bootcamp_name": bootcamp_id_to_name.get(bootcamp_id, bootcamp_id),
+        "total_students": total,
+        "domains": to_json(domain_data)
+    }
 
 
 @app.get("/stats/domain/{domain_id}")
 def domain_stats(domain_id: str):
+    domain_id_to_name, _ = build_domain_maps()
+    bootcamp_id_to_name  = build_bootcamp_map()
+
     pipeline = [
-        {"$match": {"role": "student", "domainId": domain_id}},
+        {"$match": {"role": "student", "domainId": flex_id(domain_id)}},
         {"$group": {"_id": "$studentBootcampId", "count": {"$sum": 1}}}
     ]
     bc_data = list(users_collection.aggregate(pipeline))
     total = sum(b["count"] for b in bc_data)
     for b in bc_data:
-        b["bootcampName"] = BOOTCAMP_ID_TO_NAME.get(b["_id"], b["_id"])
-    return {"domain_id": domain_id, "domain_name": DOMAIN_ID_TO_NAME.get(domain_id, domain_id),
-            "total_students": total, "bootcamps": to_json(bc_data)}
+        b["bootcampName"] = bootcamp_id_to_name.get(str(b["_id"]), str(b["_id"]))
+
+    return {
+        "domain_id": domain_id,
+        "domain_name": domain_id_to_name.get(domain_id, domain_id),
+        "total_students": total,
+        "bootcamps": to_json(bc_data)
+    }
 
 
 # ═══════════════════════════════════════════════
@@ -156,70 +195,68 @@ def domain_stats(domain_id: str):
 @app.get("/admin/bootcamp-overview")
 def admin_bootcamp_overview():
     """
-    For every bootcamp → every domain:
-      - student count
-      - total assignments in that domain
-      - submitted count (Accepted)
-      - not-submitted count
+    Dynamic: fetches all bootcamps and domains from DB.
+    Uses aggregation to minimise round-trips.
     """
+    bootcamps = get_all_bootcamps()
+    domains   = get_all_domains()
+
     result = []
-    for bc in BOOTCAMPS:
-        bc_id = bc["id"]
+    for bc in bootcamps:
+        bc_id   = str(bc["_id"])
+        bc_name = bc.get("name", bc_id)
         domains_detail = []
-        for dom in DOMAINS:
-            dom_id = dom["id"]
 
-            # student count in this domain × bootcamp combo
-            student_count = users_collection.count_documents({
-                "role": "student",
-                "studentBootcampId": bc_id,
-                "domainId": dom_id
-            })
+        for dom in domains:
+            dom_id     = str(dom["_id"])
+            dom_name   = dom.get("name", dom_id)
+            teacher_id = str(dom.get("teacherId", ""))
 
-            # assignments for this domain (we store domainId as string in assignments)
-            assignments = list(assignments_collection.find({
-                "domain": dom_id,
-                "status": "Active"
-            }))
-            assignment_ids = [a["_id"] for a in assignments]
-            total_assignments = len(assignments)
-
-            # submissions for students in this domain×bootcamp
-            # get student ids first
-            student_ids = [s["_id"] for s in users_collection.find(
-                {"role": "student", "studentBootcampId": bc_id, "domainId": dom_id},
+            # student ids in this domain × bootcamp
+            student_docs = list(users_collection.find(
+                {"role": "student", "studentBootcampId": flex_id(bc_id), "domainId": flex_id(dom_id)},
                 {"_id": 1}
-            )]
+            ))
+            student_ids   = [s["_id"] for s in student_docs]
+            student_count = len(student_ids)
 
-            submitted = student_assignments.count_documents({
-                "studentId": {"$in": student_ids},
-                "assignmentId": {"$in": assignment_ids},
-                "status": "Accepted"
-            }) if student_ids and assignment_ids else 0
+            # active assignments for this domain
+            assignment_docs = list(assignments_collection.find(
+                {"domain": flex_id(dom_id), "status": "Active"},
+                {"_id": 1}
+            ))
+            assignment_ids    = [a["_id"] for a in assignment_docs]
+            total_assignments = len(assignment_ids)
 
-            # unique students who submitted at least one
-            submitted_students = len(student_assignments.distinct("studentId", {
-                "studentId": {"$in": student_ids},
-                "status": "Accepted"
-            })) if student_ids else 0
-
-            not_submitted_students = student_count - submitted_students
+            submitted = 0
+            submitted_students = 0
+            if student_ids and assignment_ids:
+                submitted = student_assignments.count_documents({
+                    "studentId":    {"$in": student_ids},
+                    "assignmentId": {"$in": assignment_ids},
+                    "status": "Accepted"
+                })
+                submitted_students = len(student_assignments.distinct("studentId", {
+                    "studentId":    {"$in": student_ids},
+                    "assignmentId": {"$in": assignment_ids},
+                    "status": "Accepted"
+                }))
 
             domains_detail.append({
-                "domain_id": dom_id,
-                "domain_name": dom["name"],
-                "teacher_id": dom["teacherId"],
-                "student_count": student_count,
-                "total_assignments": total_assignments,
-                "submitted_count": submitted,
-                "submitted_students": submitted_students,
-                "not_submitted_students": not_submitted_students,
+                "domain_id":              dom_id,
+                "domain_name":            dom_name,
+                "teacher_id":             teacher_id,
+                "student_count":          student_count,
+                "total_assignments":      total_assignments,
+                "submitted_count":        submitted,
+                "submitted_students":     submitted_students,
+                "not_submitted_students": student_count - submitted_students,
             })
 
         result.append({
-            "bootcamp_id": bc_id,
-            "bootcamp_name": bc["name"],
-            "domains": domains_detail,
+            "bootcamp_id":    bc_id,
+            "bootcamp_name":  bc_name,
+            "domains":        domains_detail,
             "total_students": sum(d["student_count"] for d in domains_detail),
         })
 
@@ -232,21 +269,20 @@ def admin_bootcamp_overview():
 
 @app.get("/assignments/domain/{domain_id}")
 def assignments_by_domain(domain_id: str):
-    """All active assignments for a domain."""
-    assignments = list(assignments_collection.find({"domain": domain_id, "status": "Active"}))
+    assignments = list(assignments_collection.find({"domain": flex_id(domain_id), "status": "Active"}))
     return {"count": len(assignments), "data": to_json(assignments)}
 
 
 @app.get("/assignments/all")
-def all_assignments():
-    """All assignments."""
-    assignments = list(assignments_collection.find({"status": "Active"}))
-    return {"count": len(assignments), "data": to_json(assignments)}
+def all_assignments(skip: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
+    """All assignments with pagination."""
+    assignments = list(assignments_collection.find({"status": "Active"}).skip(skip).limit(limit))
+    total = assignments_collection.count_documents({"status": "Active"})
+    return {"total": total, "skip": skip, "limit": limit, "count": len(assignments), "data": to_json(assignments)}
 
 
 @app.get("/assignments/detail/{assignment_id}")
 def assignment_detail(assignment_id: str):
-    """Full details of one assignment by ObjectId."""
     a = assignments_collection.find_one({"_id": safe_oid(assignment_id)})
     if not a:
         raise HTTPException(status_code=404, detail="Assignment not found")
@@ -255,7 +291,6 @@ def assignment_detail(assignment_id: str):
 
 @app.get("/assignments/by-name/{name}")
 def assignment_by_name(name: str):
-    """Find assignments by name (case-insensitive)."""
     assignments = list(assignments_collection.find({"title": {"$regex": name, "$options": "i"}}))
     if not assignments:
         raise HTTPException(status_code=404, detail="No assignments found with that name")
@@ -267,34 +302,31 @@ def assignment_by_name(name: str):
 # ═══════════════════════════════════════════════
 
 class Submission(BaseModel):
-    roll_no: int          # student uses roll number
+    roll_no: int
     assignment_id: str
     url: str
 
 
 @app.post("/assignments/submit")
 def submit_assignment(data: Submission):
-    """Submit an assignment using roll number."""
-    # 1. resolve student from roll number
-    student = student_by_roll(data.roll_no)
-    student_obj_id = student["_id"]
-
+    student         = student_by_roll(data.roll_no)
+    student_obj_id  = student["_id"]
     assignment_obj_id = safe_oid(data.assignment_id)
 
-    # 2. check assignment
     assignment = assignments_collection.find_one({"_id": assignment_obj_id, "status": "Active"})
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found or inactive")
 
-    # 3. scrape content
     content = get_content(data.url)
     if not content or len(content) < 50:
         raise HTTPException(status_code=400, detail="Content not readable from URL")
 
-    # 4. similarity check against ALL previous submissions of this student
+    # Similarity check against all previous submissions of this student
     all_subs = student_assignments.find({"studentId": student_obj_id})
     for sub in all_subs:
         old_content = sub.get("content", "")
+        if not old_content:
+            continue
         similarity = get_similarity(content, old_content)
         if similarity > 60:
             raise HTTPException(
@@ -302,15 +334,15 @@ def submit_assignment(data: Submission):
                 detail=f"Rejected ❌ Similarity {similarity:.2f}% > 60% with a previous submission"
             )
 
-    # 5. upsert
+    now = utcnow()
     student_assignments.update_one(
         {"studentId": student_obj_id, "assignmentId": assignment_obj_id},
         {"$set": {
-            "URL": data.url,
-            "content": content,
-            "submittedAt": datetime.utcnow(),
-            "status": "Accepted",
-            "rollNo": data.roll_no,
+            "URL":         data.url,
+            "content":     content,
+            "submittedAt": now,
+            "status":      "Accepted",
+            "rollNo":      data.roll_no,
         }},
         upsert=True
     )
@@ -318,43 +350,73 @@ def submit_assignment(data: Submission):
 
 
 @app.get("/assignments/submissions/all")
-def all_submissions():
-    """All submissions across all students."""
-    subs = list(student_assignments.find())
-    # enrich with student roll and assignment name
-    enriched = []
+def all_submissions(skip: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
+    """
+    All submissions with student + assignment info via $lookup aggregation
+    (avoids N+1 queries).
+    """
+    pipeline = [
+        {"$skip": skip},
+        {"$limit": limit},
+        {"$lookup": {
+            "from": "users",
+            "localField": "studentId",
+            "foreignField": "_id",
+            "as": "studentDoc"
+        }},
+        {"$lookup": {
+            "from": "assignments",
+            "localField": "assignmentId",
+            "foreignField": "_id",
+            "as": "assignmentDoc"
+        }},
+        {"$addFields": {
+            "studentRollNo":   {"$arrayElemAt": ["$studentDoc.rollNo", 0]},
+            "studentName":     {"$arrayElemAt": ["$studentDoc.name", 0]},
+            "domainId":        {"$arrayElemAt": ["$studentDoc.domainId", 0]},
+            "bootcampId":      {"$arrayElemAt": ["$studentDoc.studentBootcampId", 0]},
+            "assignmentTitle": {"$arrayElemAt": ["$assignmentDoc.title", 0]},
+        }},
+        {"$project": {"studentDoc": 0, "assignmentDoc": 0, "content": 0}}
+    ]
+    subs  = list(student_assignments.aggregate(pipeline))
+    total = student_assignments.count_documents({})
+
+    domain_id_to_name, _ = build_domain_maps()
+    bootcamp_id_to_name  = build_bootcamp_map()
+
     for s in subs:
-        sid = s.get("studentId")
-        aid = s.get("assignmentId")
-        student = users_collection.find_one({"_id": sid}, {"rollNo": 1, "name": 1, "domainId": 1, "studentBootcampId": 1}) if sid else None
-        assignment = assignments_collection.find_one({"_id": aid}, {"title": 1}) if aid else None
-        s["studentRollNo"]  = student.get("rollNo") if student else None
-        s["studentName"]    = student.get("name") if student else None
-        s["domainName"]     = DOMAIN_ID_TO_NAME.get(student.get("domainId", ""), "") if student else ""
-        s["bootcampName"]   = BOOTCAMP_ID_TO_NAME.get(student.get("studentBootcampId", ""), "") if student else ""
-        s["assignmentTitle"]= assignment.get("title") if assignment else None
-        enriched.append(s)
-    return {"count": len(enriched), "data": to_json(enriched)}
+        s["domainName"]   = domain_id_to_name.get(str(s.get("domainId", "")), "")
+        s["bootcampName"] = bootcamp_id_to_name.get(str(s.get("bootcampId", "")), "")
+
+    return {"total": total, "skip": skip, "limit": limit, "count": len(subs), "data": to_json(subs)}
 
 
 @app.get("/assignments/submissions/by-assignment/{assignment_id}")
 def submissions_by_assignment(assignment_id: str):
-    """All submissions for a specific assignment."""
     aid = safe_oid(assignment_id)
-    subs = list(student_assignments.find({"assignmentId": aid}))
-    for s in subs:
-        sid = s.get("studentId")
-        student = users_collection.find_one({"_id": sid}, {"rollNo": 1, "name": 1}) if sid else None
-        s["studentRollNo"] = student.get("rollNo") if student else None
-        s["studentName"]   = student.get("name") if student else None
+    pipeline = [
+        {"$match": {"assignmentId": aid}},
+        {"$lookup": {
+            "from": "users",
+            "localField": "studentId",
+            "foreignField": "_id",
+            "as": "studentDoc"
+        }},
+        {"$addFields": {
+            "studentRollNo": {"$arrayElemAt": ["$studentDoc.rollNo", 0]},
+            "studentName":   {"$arrayElemAt": ["$studentDoc.name", 0]},
+        }},
+        {"$project": {"studentDoc": 0, "content": 0}}
+    ]
+    subs = list(student_assignments.aggregate(pipeline))
     return {"count": len(subs), "data": to_json(subs)}
 
 
 @app.get("/assignments/submission/{student_id}/{assignment_id}")
 def get_submission(student_id: str, assignment_id: str):
-    """Single submission by student ObjectId + assignment ObjectId."""
     sub = student_assignments.find_one({
-        "studentId": safe_oid(student_id),
+        "studentId":    safe_oid(student_id),
         "assignmentId": safe_oid(assignment_id)
     })
     if not sub:
@@ -368,45 +430,31 @@ def get_submission(student_id: str, assignment_id: str):
 
 @app.get("/student/panel/{roll_no}")
 def student_panel(roll_no: int):
-    """
-    Full student dashboard:
-    - personal details (bootcamp, domain, teacher)
-    - all assignments in their domain
-    - which they submitted / remaining
-    - their notifications
-    """
-    s = student_by_roll(roll_no)
-    s = enrich_student(s)
+    s          = enrich_student(student_by_roll(roll_no))
     student_id = s["_id"]
-    domain_id  = s.get("domainId", "")
+    domain_id  = str(s.get("domainId", ""))
 
-    # assignments for this domain
-    assignments = list(assignments_collection.find({"domain": domain_id, "status": "Active"}))
-    total_assignments = len(assignments)
+    assignments = list(assignments_collection.find({"domain": flex_id(domain_id), "status": "Active"}))
 
-    # what student submitted
-    submitted_ids = set(
-        str(sub["assignmentId"])
+    # Fetch all submissions for this student in one query
+    sub_map = {
+        str(sub["assignmentId"]): sub
         for sub in student_assignments.find({"studentId": student_id, "status": "Accepted"})
-    )
+    }
 
     assignments_list = []
     for a in assignments:
         aid_str = str(a["_id"])
-        sub = student_assignments.find_one({"studentId": student_id, "assignmentId": a["_id"]})
+        sub     = sub_map.get(aid_str)
         assignments_list.append({
             "assignment_id": aid_str,
-            "title": a.get("title", "Untitled"),
-            "deadline": str(a.get("deadline", "")),
-            "status": sub.get("status", "Not Submitted") if sub else "Not Submitted",
-            "submittedAt": str(sub.get("submittedAt", "")) if sub else "",
-            "url": sub.get("URL", "") if sub else "",
+            "title":         a.get("title", "Untitled"),
+            "deadline":      str(a.get("deadline", "")),
+            "status":        sub.get("status", "Not Submitted") if sub else "Not Submitted",
+            "submittedAt":   str(sub.get("submittedAt", "")) if sub else "",
+            "url":           sub.get("URL", "") if sub else "",
         })
 
-    submitted_count  = len(submitted_ids)
-    remaining_count  = total_assignments - submitted_count
-
-    # student notifications
     student_notifs = list(notifications_col.find(
         {"studentId": str(student_id)},
         sort=[("createdAt", -1)],
@@ -414,12 +462,12 @@ def student_panel(roll_no: int):
     ))
 
     return {
-        "student": to_json(s),
-        "total_assignments": total_assignments,
-        "submitted_count": submitted_count,
-        "remaining_count": remaining_count,
-        "assignments": to_json(assignments_list),
-        "notifications": to_json(student_notifs),
+        "student":          to_json(s),
+        "total_assignments": len(assignments),
+        "submitted_count":  len(sub_map),
+        "remaining_count":  len(assignments) - len(sub_map),
+        "assignments":      to_json(assignments_list),
+        "notifications":    to_json(student_notifs),
     }
 
 
@@ -429,81 +477,116 @@ def student_panel(roll_no: int):
 
 @app.get("/notifications/admin")
 def admin_notifications():
-    """Latest 50 admin notifications (missed submissions)."""
     notifs = list(notifications_col.find(sort=[("createdAt", -1)], limit=50))
-    # enrich with roll numbers
+
+    # Collect all unique IDs to batch-fetch
+    student_ids    = []
+    assignment_ids = []
     for n in notifs:
-        sid = n.get("studentId", "")
+        sid = n.get("studentId")
+        aid = n.get("assignmentId")
         try:
-            student = users_collection.find_one({"_id": ObjectId(sid)}, {"rollNo": 1, "name": 1, "domainId": 1})
-            n["studentRollNo"] = student.get("rollNo") if student else None
-            n["studentName"]   = student.get("name") if student else None
-            n["domainName"]    = DOMAIN_ID_TO_NAME.get(student.get("domainId", ""), "") if student else ""
+            student_ids.append(ObjectId(sid))
         except Exception:
-            n["studentRollNo"] = None
-            n["studentName"]   = None
-            n["domainName"]    = ""
-        aid = n.get("assignmentId", "")
+            pass
         try:
-            a = assignments_collection.find_one({"_id": ObjectId(aid)}, {"title": 1})
-            n["assignmentTitle"] = a.get("title") if a else None
+            assignment_ids.append(ObjectId(aid))
         except Exception:
-            n["assignmentTitle"] = None
+            pass
+
+    # Batch fetch students and assignments
+    students_map    = {str(s["_id"]): s for s in users_collection.find({"_id": {"$in": student_ids}})}
+    assignments_map = {str(a["_id"]): a for a in assignments_collection.find({"_id": {"$in": assignment_ids}})}
+
+    domain_id_to_name, _ = build_domain_maps()
+
+    for n in notifs:
+        sid     = str(n.get("studentId", ""))
+        aid     = str(n.get("assignmentId", ""))
+        student = students_map.get(sid)
+        assign  = assignments_map.get(aid)
+
+        n["studentRollNo"]   = student.get("rollNo") if student else None
+        n["studentName"]     = student.get("name") if student else None
+        n["domainName"]      = domain_id_to_name.get(str(student.get("domainId", "")), "") if student else ""
+        n["assignmentTitle"] = assign.get("title") if assign else None
+
     return {"count": len(notifs), "data": to_json(notifs)}
 
 
 @app.get("/notifications/student/{roll_no}")
 def student_notifications(roll_no: int):
-    """Notifications for a specific student by roll number."""
-    s = student_by_roll(roll_no)
+    s   = student_by_roll(roll_no)
     sid = str(s["_id"])
     notifs = list(notifications_col.find({"studentId": sid}, sort=[("createdAt", -1)], limit=20))
     return {"count": len(notifs), "data": to_json(notifs)}
 
 
+@app.delete("/notifications/{notif_id}")
+def delete_notification(notif_id: str):
+    res = notifications_col.delete_one({"_id": safe_oid(notif_id)})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return {"message": "Notification deleted successfully"}
+
+
 @app.get("/check-missed-assignments")
 def check_missed_assignments():
     """Scan all students, create notifications for missed deadlines."""
-    now = datetime.utcnow()
-    notifications = []
+    now = utcnow()
+
+    # Batch-fetch all active assignments with a deadline in the past
+    past_assignments = list(assignments_collection.find({
+        "status": "Active",
+        "deadline": {"$lt": now}
+    }))
+
+    if not past_assignments:
+        return {"total_notifications": 0, "data": []}
+
+    assignment_ids = [a["_id"] for a in past_assignments]
+
+    # Map assignment_id → assignment doc
+    assign_map = {a["_id"]: a for a in past_assignments}
+
     students = list(users_collection.find({"role": "student"}))
 
+    # Batch-fetch all existing submissions for these assignments
+    existing_subs = set(
+        (str(s["studentId"]), str(s["assignmentId"]))
+        for s in student_assignments.find({"assignmentId": {"$in": assignment_ids}})
+    )
+
+    # Batch-fetch already-created notifications to avoid duplicates
+    existing_notifs = set(
+        (n["studentId"], n["assignmentId"])
+        for n in notifications_col.find({"assignmentId": {"$in": [str(a) for a in assignment_ids]}})
+    )
+
+    notifications = []
     for student in students:
         student_id  = student["_id"]
         domain_id   = student.get("domainId", "")
         bootcamp_id = student.get("studentBootcampId", "")
 
-        assignments = list(assignments_collection.find({
-            "domain": domain_id,
-            "status": "Active"
-        }))
-
-        for assignment in assignments:
-            deadline = assignment.get("deadline")
-            if not deadline:
+        for assignment in past_assignments:
+            # Only assignments in the student's domain (compare as strings to handle ObjectId/string mix)
+            if str(assignment.get("domain")) != str(domain_id):
                 continue
-            if now > deadline:
-                submission = student_assignments.find_one({
-                    "studentId": student_id,
-                    "assignmentId": assignment["_id"]
+
+            key       = (str(student_id), str(assignment["_id"]))
+            notif_key = (str(student_id), str(assignment["_id"]))
+
+            if key not in existing_subs and notif_key not in existing_notifs:
+                notifications.append({
+                    "studentId":    str(student_id),
+                    "assignmentId": str(assignment["_id"]),
+                    "message":      f"{student.get('name', 'Student')} (Roll #{student.get('rollNo')}) has not submitted '{assignment.get('title', 'assignment')}'",
+                    "rollNo":       student.get("rollNo"),
+                    "domainId":     domain_id,
+                    "bootcampId":   bootcamp_id,
+                    "createdAt":    now,
                 })
-                if not submission:
-                    # avoid duplicate notifications
-                    already = notifications_col.find_one({
-                        "studentId": str(student_id),
-                        "assignmentId": str(assignment["_id"])
-                    })
-                    if not already:
-                        notif = {
-                            "studentId": str(student_id),
-                            "assignmentId": str(assignment["_id"]),
-                            "message": f"{student.get('name', 'Student')} (Roll #{student.get('rollNo')}) has not submitted '{assignment.get('title', 'assignment')}'",
-                            "rollNo": student.get("rollNo"),
-                            "domainId": domain_id,
-                            "bootcampId": bootcamp_id,
-                            "createdAt": now
-                        }
-                        notifications.append(notif)
 
     if notifications:
         notifications_col.insert_many(notifications)
@@ -517,7 +600,6 @@ def check_missed_assignments():
 
 @app.get("/teachers")
 def get_teachers():
-    """All teachers."""
     teachers = list(users_collection.find({"role": "teacher"}))
     return {"count": len(teachers), "data": to_json(teachers)}
 
@@ -531,12 +613,11 @@ def get_teacher(teacher_id: str):
 
 
 # ═══════════════════════════════════════════════
-# 9. SEARCH – student by roll OR id
+# 9. SEARCH
 # ═══════════════════════════════════════════════
 
 @app.get("/search/student")
 def search_student(roll_no: int = None, student_id: str = None):
-    """Search student by roll_no or student_id query param."""
     if roll_no:
         s = users_collection.find_one({"rollNo": roll_no, "role": "student"})
     elif student_id:
@@ -550,10 +631,6 @@ def search_student(roll_no: int = None, student_id: str = None):
 
 @app.get("/search/student-submissions")
 def search_student_submissions(roll_no: int = None, student_id: str = None):
-    """
-    How many assignments a specific student submitted vs remaining.
-    Search by roll_no or student_id.
-    """
     if roll_no:
         s = users_collection.find_one({"rollNo": roll_no, "role": "student"})
     elif student_id:
@@ -563,161 +640,167 @@ def search_student_submissions(roll_no: int = None, student_id: str = None):
     if not s:
         raise HTTPException(status_code=404, detail="Student not found")
 
-    domain_id  = s.get("domainId", "")
+    domain_id   = str(s.get("domainId", ""))
     student_oid = s["_id"]
 
-    # total assignments in domain
+    domain_id_to_name, _ = build_domain_maps()
+    bootcamp_id_to_name  = build_bootcamp_map()
+
     total = assignments_collection.count_documents({"domain": domain_id, "status": "Active"})
 
-    # submitted
-    subs = list(student_assignments.find({"studentId": student_oid, "status": "Accepted"}))
+    # Use aggregation to get submission + assignment title in one shot
+    pipeline = [
+        {"$match": {"studentId": student_oid, "status": "Accepted"}},
+        {"$lookup": {
+            "from": "assignments",
+            "localField": "assignmentId",
+            "foreignField": "_id",
+            "as": "assignmentDoc"
+        }},
+        {"$addFields": {"assignmentTitle": {"$arrayElemAt": ["$assignmentDoc.title", 0]}}},
+        {"$project": {"assignmentDoc": 0, "content": 0}}
+    ]
+    subs = list(student_assignments.aggregate(pipeline))
 
-    submitted_list = []
-    for sub in subs:
-        a = assignments_collection.find_one({"_id": sub["assignmentId"]}, {"title": 1})
-        submitted_list.append({
+    submitted_list = [
+        {
             "assignment_id": str(sub["assignmentId"]),
-            "title": a.get("title") if a else "",
-            "submittedAt": str(sub.get("submittedAt", "")),
-            "url": sub.get("URL", ""),
-        })
+            "title":         sub.get("assignmentTitle", ""),
+            "submittedAt":   str(sub.get("submittedAt", "")),
+            "url":           sub.get("URL", ""),
+        }
+        for sub in subs
+    ]
 
     return {
-        "student_name": s.get("name"),
-        "roll_no": s.get("rollNo"),
-        "domain": DOMAIN_ID_TO_NAME.get(domain_id, domain_id),
-        "bootcamp": BOOTCAMP_ID_TO_NAME.get(s.get("studentBootcampId", ""), ""),
+        "student_name":    s.get("name"),
+        "roll_no":         s.get("rollNo"),
+        "domain":          domain_id_to_name.get(domain_id, domain_id),
+        "bootcamp":        bootcamp_id_to_name.get(str(s.get("studentBootcampId", "")), ""),
         "total_assignments": total,
         "submitted_count": len(subs),
         "remaining_count": total - len(subs),
-        "submitted": to_json(submitted_list),
+        "submitted":       to_json(submitted_list),
     }
-attendance_collection = db["attendance"]
 
-from datetime import datetime, UTC
+
+# ═══════════════════════════════════════════════
+# 10. ATTENDANCE
+# ═══════════════════════════════════════════════
 
 @app.get("/attendance/late-today")
 def late_comers_today():
-    today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end   = datetime.now(UTC).replace(hour=23, minute=59, second=59)
+    now         = utcnow()
+    today_start = now.replace(hour=0,  minute=0,  second=0,  microsecond=0)
+    today_end   = now.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-    late_records = list(attendance_collection.find({
-        "status": "late",
-        "checkInTime": {"$gte": today_start, "$lte": today_end}
-    }))
+    # Use aggregation to avoid N+1 queries
+    pipeline = [
+        {"$match": {"status": "late", "checkInTime": {"$gte": today_start, "$lte": today_end}}},
+        {"$lookup": {
+            "from": "users",
+            "localField": "studentId",
+            "foreignField": "_id",
+            "as": "studentDoc"
+        }},
+        {"$addFields": {
+            "studentName": {"$arrayElemAt": ["$studentDoc.name", 0]},
+            "rollNo":      {"$arrayElemAt": ["$studentDoc.rollNo", 0]},
+        }},
+        {"$project": {"studentDoc": 0}}
+    ]
+    records = list(attendance_collection.aggregate(pipeline))
 
-    result = []
+    result = [
+        {
+            "studentName": r.get("studentName"),
+            "rollNo":      r.get("rollNo"),
+            "checkInTime": str(r.get("checkInTime")),
+        }
+        for r in records
+    ]
 
-    for record in late_records:
-        student = users_collection.find_one(
-            {"_id": record["studentId"]},
-            {"name": 1, "rollNo": 1}
-        )
-
-        result.append({
-            "studentName": student.get("name") if student else None,
-            "rollNo": student.get("rollNo") if student else None,
-            "checkInTime": str(record.get("checkInTime")),
-        })
-
-    return {
-        "total_late_today": len(result),   # ✅ NEW
-        "late_students": result
-    }
+    return {"total_late_today": len(result), "late_students": result}
 
 
 @app.get("/attendance/late-percentage")
 def late_percentage():
-    students = list(users_collection.find({"role": "student"}))
+    """
+    Aggregate attendance stats per student without per-student DB queries.
+    """
+    pipeline = [
+        {"$group": {
+            "_id":     "$studentId",
+            "total":   {"$sum": 1},
+            "late":    {"$sum": {"$cond": [{"$eq": ["$status", "late"]},    1, 0]}},
+            "present": {"$sum": {"$cond": [{"$eq": ["$status", "present"]}, 1, 0]}},
+            "absent":  {"$sum": {"$cond": [{"$eq": ["$status", "absent"]},  1, 0]}},
+        }},
+        {"$match": {"total": {"$gt": 0}}},
+        {"$lookup": {
+            "from": "users",
+            "localField": "_id",
+            "foreignField": "_id",
+            "as": "studentDoc"
+        }},
+        {"$addFields": {
+            "studentName":      {"$arrayElemAt": ["$studentDoc.name",   0]},
+            "rollNo":           {"$arrayElemAt": ["$studentDoc.rollNo", 0]},
+            "late_percentage":  {"$round": [{"$multiply": [{"$divide": ["$late", "$total"]}, 100]}, 2]},
+            "on_time_percentage": {"$round": [{"$multiply": [{"$divide": ["$present", "$total"]}, 100]}, 2]},
+        }},
+        {"$project": {"studentDoc": 0}},
+        {"$sort": {"late_percentage": -1}}
+    ]
 
-    result = []
-
-    for student in students:
-        sid = student["_id"]
-
-        records = list(attendance_collection.find({"studentId": sid}))
-        total = len(records)
-
-        if total == 0:
-            continue
-
-        late = sum(1 for r in records if r["status"] == "late")
-        present = sum(1 for r in records if r["status"] == "present")
-        absent = sum(1 for r in records if r["status"] == "absent")
-
-        late_percent = (late / total) * 100
-        ontime_percent = (present / total) * 100
-
-        result.append({
-            "studentName": student.get("name"),
-            "rollNo": student.get("rollNo"),
-            "total_days": total,
-            "late_days": late,
-            "present_days": present,
-            "absent_days": absent,
-            "late_percentage": round(late_percent, 2),
-            "on_time_percentage": round(ontime_percent, 2)
-        })
-
-    # sort highest late first
-    result = sorted(result, key=lambda x: x["late_percentage"], reverse=True)
-
-    # ✅ NEW: total late students (>0 late)
-    total_late_students = sum(1 for r in result if r["late_days"] > 0)
+    result = list(attendance_collection.aggregate(pipeline))
+    total_late_students = sum(1 for r in result if r.get("late", 0) > 0)
 
     return {
         "total_students_with_late": total_late_students,
-        "students": result
+        "students": to_json(result)
     }
+
+
 @app.get("/attendance/student/{roll_no}")
 def student_late_history(roll_no: int):
-    # find student
     student = users_collection.find_one({"rollNo": roll_no, "role": "student"})
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
-    sid = student["_id"]
-
-    records = list(attendance_collection.find(
-        {"studentId": sid},
-        sort=[("checkInTime", -1)]
-    ))
+    sid     = student["_id"]
+    records = list(attendance_collection.find({"studentId": sid}, sort=[("checkInTime", -1)]))
 
     if not records:
         return {
             "studentName": student.get("name"),
-            "rollNo": roll_no,
-            "message": "No attendance records found"
+            "rollNo":      roll_no,
+            "message":     "No attendance records found"
         }
 
-    total = len(records)
-    late = sum(1 for r in records if r["status"] == "late")
+    total   = len(records)
+    late    = sum(1 for r in records if r["status"] == "late")
     present = sum(1 for r in records if r["status"] == "present")
-    absent = sum(1 for r in records if r["status"] == "absent")
+    absent  = sum(1 for r in records if r["status"] == "absent")
 
-    # percentages
-    late_percent = (late / total) * 100
-    ontime_percent = (present / total) * 100
-
-    history = []
-
-    for r in records:
-        history.append({
-            "date": str(r.get("checkInTime")),
-            "status": r.get("status"),
-            "checkInTime": str(r.get("checkInTime")),
+    history = [
+        {
+            "date":         str(r.get("checkInTime")),
+            "status":       r.get("status"),
+            "checkInTime":  str(r.get("checkInTime")),
             "checkOutTime": str(r.get("checkOutTime")),
-        })
+        }
+        for r in records
+    ]
 
     return {
-        "studentName": student.get("name"),
-        "rollNo": roll_no,
-        "total_days": total,
-        "late_days": late,
-        "present_days": present,
-        "absent_days": absent,
-        "late_percentage": round(late_percent, 2),
-        "on_time_percentage": round(ontime_percent, 2),
-        "history": history
+        "studentName":       student.get("name"),
+        "rollNo":            roll_no,
+        "total_days":        total,
+        "late_days":         late,
+        "present_days":      present,
+        "absent_days":       absent,
+        "late_percentage":   round((late / total) * 100, 2),
+        "on_time_percentage": round((present / total) * 100, 2),
+        "history":           history,
     }
-

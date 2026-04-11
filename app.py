@@ -1,27 +1,43 @@
 import streamlit as st
 import requests
 import json
+import os
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+from dotenv import load_dotenv
 
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-BASE_URL = "http://localhost:8000"
+load_dotenv()
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
-BOOTCAMPS = {
-    "Bootcamp 4.0": "69c538969d2f7dcce6f2df20",
-    "Bootcamp 3.0": "69c63a4736adc54470ff7703",
-    "Bootcamp 2.0": "69c63a5336adc54470ff7704",
-}
 
-DOMAINS = {
-    "Web Development": "69c538969d2f7dcce6f2df24",
-    "AI Engineering":  "69c538969d2f7dcce6f2df26",
-    "UI UX":           "69c53f3b0b619312a3c67d7c",
-}
+# ─────────────────────────────────────────────
+# DYNAMIC BOOTCAMP / DOMAIN LOADING
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=60)
+def load_bootcamps_and_domains():
+    """Fetch bootcamps & domains from the API instead of hardcoding."""
+    try:
+        r = requests.get(f"{BASE_URL}/admin/bootcamp-overview", timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return {}, {}
+
+    bootcamps = {}
+    domains = {}
+    for bc in data.get("bootcamps", []):
+        bootcamps[bc["bootcamp_name"]] = bc["bootcamp_id"]
+        for dom in bc.get("domains", []):
+            domains[dom["domain_name"]] = dom["domain_id"]
+    return bootcamps, domains
+
+
+BOOTCAMPS, DOMAINS = load_bootcamps_and_domains()
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -42,6 +58,17 @@ def get(path):
 def post(path, payload):
     try:
         r = requests.post(f"{BASE_URL}{path}", json=payload, timeout=30)
+        if r.ok:
+            return r.json(), None
+        return None, r.json().get("detail", r.text)
+    except requests.exceptions.ConnectionError:
+        return None, "⚠️ Cannot reach API."
+    except Exception as e:
+        return None, str(e)
+
+def delete(path):
+    try:
+        r = requests.delete(f"{BASE_URL}{path}", timeout=15)
         if r.ok:
             return r.json(), None
         return None, r.json().get("detail", r.text)
@@ -250,16 +277,23 @@ if panel == "Admin":
                 roll = n.get("studentRollNo", "")
                 dom  = n.get("domainName", "")
                 asgn = n.get("assignmentTitle", "Assignment")
-                ts   = n.get("createdAt", {})
-                if isinstance(ts, dict): ts = ts.get("$date", "")
-                st.markdown(f"""<div class='notif-box'>
-                    <div class='notif-title'> Missed Submission</div>
-                    {msg}<br>
-                    <span class='chip chip-gray'>Roll #{roll}</span>
-                    <span class='chip chip-blue'>{dom}</span>
-                    <span class='chip chip-orange'>{asgn}</span>
-                    <span style='font-size:0.7rem;color:#94a3b8;'>{str(ts)[:19]}</span>
-                </div>""", unsafe_allow_html=True)
+                    ts   = n.get("createdAt", {})
+                    if isinstance(ts, dict): ts = ts.get("$date", "")
+                    
+                    st.markdown(f"""<div class='notif-box'>
+                        <div class='notif-title'> Missed Submission</div>
+                        {msg}<br>
+                        <span class='chip chip-gray'>Roll #{roll}</span>
+                        <span class='chip chip-blue'>{dom}</span>
+                        <span class='chip chip-orange'>{asgn}</span>
+                        <span style='font-size:0.7rem;color:#94a3b8;'>{str(ts)[:19]}</span>
+                    </div>""", unsafe_allow_html=True)
+                    
+                    notif_id = n.get("_id", {}).get("$oid") if isinstance(n.get("_id"), dict) else str(n.get("_id", ""))
+                    if st.button("Mark as Read", key=f"mark_admin_{notif_id}"):
+                        _, derr = delete(f"/notifications/{notif_id}")
+                        if derr: err(derr)
+                        else: st.rerun()
         st.markdown("")
 
     # ──────────────────────────────────────────
@@ -334,64 +368,81 @@ if panel == "Admin":
         selected_bc = st.selectbox("Select Bootcamp", list(BOOTCAMPS.keys()))
         bid = BOOTCAMPS[selected_bc]
 
+        # Reset cache when bootcamp selection changes
+        if st.session_state.get("bc_details_bid") != bid:
+            st.session_state.pop("bc_details_data", None)
+            st.session_state["bc_details_bid"] = bid
+            # Clear any view-students results from previous bootcamp
+            keys_to_remove = [k for k in st.session_state if k.startswith("vs_data_")]
+            for k in keys_to_remove:
+                del st.session_state[k]
+
         if st.button("Load Details"):
-            # overview for this bootcamp
             overview, ov_err = get("/admin/bootcamp-overview")
-            stats, st_err   = get(f"/stats/bootcamp/{bid}")
-
-            if ov_err: err(ov_err)
+            if ov_err:
+                err(ov_err)
             else:
-                # find this bootcamp in overview
                 bc_data = next((b for b in overview["bootcamps"] if b["bootcamp_id"] == bid), None)
+                st.session_state["bc_details_data"] = bc_data
 
-                if bc_data:
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Total Students", bc_data["total_students"])
-                    c2.metric("Domains", len(bc_data["domains"]))
-                    total_asgn = sum(d["total_assignments"] for d in bc_data["domains"])
-                    c3.metric("Active Assignments", total_asgn)
+        # Render from session_state (persists across reruns)
+        bc_data = st.session_state.get("bc_details_data")
+        if bc_data:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Students", bc_data["total_students"])
+            c2.metric("Domains", len(bc_data["domains"]))
+            total_asgn = sum(d["total_assignments"] for d in bc_data["domains"])
+            c3.metric("Active Assignments", total_asgn)
 
-                    st.markdown("### Domain Breakdown")
-                    for dom in bc_data["domains"]:
-                        with st.expander(f" {dom['domain_name']}  —  {dom['student_count']} students"):
-                            dc1, dc2, dc3, dc4 = st.columns(4)
-                            dc1.metric("Students", dom["student_count"])
-                            dc2.metric("Assignments", dom["total_assignments"])
-                            dc3.metric("Submitted (students)", dom["submitted_students"])
-                            dc4.metric("Not Submitted", dom["not_submitted_students"])
+            st.markdown("### Domain Breakdown")
+            for dom in bc_data["domains"]:
+                with st.expander(f" {dom['domain_name']}  —  {dom['student_count']} students"):
+                    dc1, dc2, dc3, dc4 = st.columns(4)
+                    dc1.metric("Students", dom["student_count"])
+                    dc2.metric("Assignments", dom["total_assignments"])
+                    dc3.metric("Submitted (students)", dom["submitted_students"])
+                    dc4.metric("Not Submitted", dom["not_submitted_students"])
 
-                            # bar chart for this domain
-                            fig = go.Figure(go.Bar(
-                                x=["Submitted", "Not Submitted"],
-                                y=[dom["submitted_students"], dom["not_submitted_students"]],
-                                marker_color=["#22c55e", "#ef4444"]
-                            ))
-                            fig.update_layout(height=220, margin=dict(t=10, b=10))
-                            st.plotly_chart(fig, use_container_width=True)
+                    fig = go.Figure(go.Bar(
+                        x=["Submitted", "Not Submitted"],
+                        y=[dom["submitted_students"], dom["not_submitted_students"]],
+                        marker_color=["#22c55e", "#ef4444"]
+                    ))
+                    fig.update_layout(height=220, margin=dict(t=10, b=10))
+                    st.plotly_chart(fig, use_container_width=True)
 
-                            # show students button
-                            if st.button(f"View Students — {dom['domain_name']}", key=f"vs_{dom['domain_id']}"):
-                                students_d, s_err = get(f"/students/domain/{dom['domain_id']}")
-                                if s_err: err(s_err)
-                                else:
-                                    slist = students_d.get("data", [])
-                                    # filter by bootcamp
-                                    slist = [s for s in slist if s.get("studentBootcampId") == bid]
-                                    for s in slist[:50]:
-                                        st.markdown(
-                                            f"<div class='card'><div class='title'>{s.get('name')} "
-                                            f"<span class='chip chip-gray'>Roll #{s.get('rollNo')}</span></div>"
-                                            f"<div class='meta'>{s.get('email')} | 📍 {s.get('location')}</div></div>",
-                                            unsafe_allow_html=True
-                                        )
+                    vs_key = f"vs_data_{dom['domain_id']}"
+                    if st.button(f"View Students — {dom['domain_name']}", key=f"vs_{dom['domain_id']}"):
+                        students_d, s_err = get(f"/students/domain/{dom['domain_id']}")
+                        if s_err:
+                            err(s_err)
+                        else:
+                            slist = students_d.get("data", [])
+                            # Handle $oid dict format from json_util
+                            def extract_id(val):
+                                if isinstance(val, dict):
+                                    return val.get("$oid", "")
+                                return str(val) if val else ""
+                            slist = [s for s in slist if extract_id(s.get("studentBootcampId")) == bid]
+                            st.session_state[vs_key] = slist
 
-                    # chart: students per domain in this bootcamp
-                    dom_names = [d["domain_name"] for d in bc_data["domains"]]
-                    dom_counts = [d["student_count"] for d in bc_data["domains"]]
-                    fig4 = px.bar(x=dom_names, y=dom_counts, labels={"x": "Domain", "y": "Students"},
-                                  color=dom_names, color_discrete_sequence=px.colors.qualitative.Vivid)
-                    fig4.update_layout(showlegend=False, margin=dict(t=10, b=10), height=280)
-                    st.plotly_chart(fig4, use_container_width=True)
+                    # Render students from session_state
+                    if vs_key in st.session_state:
+                        for s in st.session_state[vs_key][:50]:
+                            st.markdown(
+                                f"<div class='card'><div class='title'>{s.get('name')} "
+                                f"<span class='chip chip-gray'>Roll #{s.get('rollNo')}</span></div>"
+                                f"<div class='meta'>{s.get('email')} | 📍 {s.get('location')}</div></div>",
+                                unsafe_allow_html=True
+                            )
+
+            # chart: students per domain in this bootcamp
+            dom_names = [d["domain_name"] for d in bc_data["domains"]]
+            dom_counts = [d["student_count"] for d in bc_data["domains"]]
+            fig4 = px.bar(x=dom_names, y=dom_counts, labels={"x": "Domain", "y": "Students"},
+                          color=dom_names, color_discrete_sequence=px.colors.qualitative.Vivid)
+            fig4.update_layout(showlegend=False, margin=dict(t=10, b=10), height=280)
+            st.plotly_chart(fig4, use_container_width=True)
 
     # ──────────────────────────────────────────
     # DOMAIN DETAILS
@@ -402,22 +453,33 @@ if panel == "Admin":
         selected_dom = st.selectbox("Select Domain", list(DOMAINS.keys()))
         did = DOMAINS[selected_dom]
 
+        # Reset cache when domain selection changes
+        if st.session_state.get("dom_details_did") != did:
+            st.session_state.pop("dom_stats_data", None)
+            st.session_state.pop("dom_asgn_data", None)
+            st.session_state["dom_details_did"] = did
+
         if st.button("Load Domain Stats"):
             data, de = get(f"/stats/domain/{did}")
             if de: err(de)
             else:
-                st.metric("Total Students", data["total_students"])
-                st.markdown("### Per Bootcamp")
-                rows = []
-                for b in data.get("bootcamps", []):
-                    rows.append({"Bootcamp": b.get("bootcampName", b["_id"]), "Students": b["count"]})
-                if rows:
-                    df = pd.DataFrame(rows)
-                    fig = px.bar(df, x="Bootcamp", y="Students",
-                                 color="Bootcamp",
-                                 color_discrete_sequence=px.colors.qualitative.Pastel1)
-                    fig.update_layout(showlegend=False, margin=dict(t=10,b=10), height=280)
-                    st.plotly_chart(fig, use_container_width=True)
+                st.session_state["dom_stats_data"] = data
+
+        # Render domain stats from session_state
+        dom_stats = st.session_state.get("dom_stats_data")
+        if dom_stats:
+            st.metric("Total Students", dom_stats["total_students"])
+            st.markdown("### Per Bootcamp")
+            rows = []
+            for b in dom_stats.get("bootcamps", []):
+                rows.append({"Bootcamp": b.get("bootcampName", b["_id"]), "Students": b["count"]})
+            if rows:
+                df = pd.DataFrame(rows)
+                fig = px.bar(df, x="Bootcamp", y="Students",
+                             color="Bootcamp",
+                             color_discrete_sequence=px.colors.qualitative.Pastel1)
+                fig.update_layout(showlegend=False, margin=dict(t=10,b=10), height=280)
+                st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("---")
         st.markdown("### Assignments in Domain")
@@ -425,18 +487,23 @@ if panel == "Admin":
             asgn, ae = get(f"/assignments/domain/{did}")
             if ae: err(ae)
             else:
-                st.markdown(f"**{asgn['count']} active assignments**")
-                for a in asgn.get("data", []):
-                    aid = a.get("_id", {})
-                    if isinstance(aid, dict): aid = aid.get("$oid", "")
-                    title = a.get("title", "Untitled")
-                    deadline = a.get("deadline", "")
-                    if isinstance(deadline, dict): deadline = deadline.get("$date", "")
-                    st.markdown(
-                        f"<div class='card'><div class='title'>{title}</div>"
-                        f"<div class='meta'>ID: {aid} | Deadline: {str(deadline)[:10]}</div></div>",
-                        unsafe_allow_html=True
-                    )
+                st.session_state["dom_asgn_data"] = asgn
+
+        # Render assignments from session_state
+        dom_asgn = st.session_state.get("dom_asgn_data")
+        if dom_asgn:
+            st.markdown(f"**{dom_asgn['count']} active assignments**")
+            for a in dom_asgn.get("data", []):
+                aid = a.get("_id", {})
+                if isinstance(aid, dict): aid = aid.get("$oid", "")
+                title = a.get("title", "Untitled")
+                deadline = a.get("deadline", "")
+                if isinstance(deadline, dict): deadline = deadline.get("$date", "")
+                st.markdown(
+                    f"<div class='card'><div class='title'>{title}</div>"
+                    f"<div class='meta'>ID: {aid} | Deadline: {str(deadline)[:10]}</div></div>",
+                    unsafe_allow_html=True
+                )
 
     # ──────────────────────────────────────────
     # STUDENT DETAILS
@@ -452,37 +519,48 @@ if panel == "Admin":
             sel = st.selectbox("Domain", list(DOMAINS.keys()))
             endpoint = f"/students/domain/{DOMAINS[sel]}"
 
+        # Reset cache when filter/selection changes
+        cache_key = f"{filter_by}_{sel}"
+        if st.session_state.get("student_details_key") != cache_key:
+            st.session_state.pop("student_details_data", None)
+            st.session_state["student_details_key"] = cache_key
+
         if st.button("Load Students"):
             data, de = get(endpoint)
             if de: err(de)
             else:
-                students = data.get("data", [])
-                st.metric("Students Found", len(students))
+                st.session_state["student_details_data"] = data.get("data", [])
 
-                search = st.text_input("🔎 Filter by name or roll no")
-                if search:
-                    students = [s for s in students
-                                if search.lower() in str(s.get("name","")).lower()
-                                or search in str(s.get("rollNo",""))]
+        # Render students from session_state
+        students = st.session_state.get("student_details_data")
+        if students is not None:
+            st.metric("Students Found", len(students))
 
-                for s in students[:100]:
-                    status = s.get("studentStatus", "")
-                    chip = "chip-green" if status == "enrolled" else "chip-red"
-                    domain_name = next((k for k,v in DOMAINS.items() if v == s.get("domainId","")), s.get("domainId",""))
-                    bc_name     = next((k for k,v in BOOTCAMPS.items() if v == s.get("studentBootcampId","")), s.get("studentBootcampId",""))
-                    st.markdown(
-                        f"<div class='card'>"
-                        f"<div class='title'>{s.get('name')} "
-                        f"<span class='chip chip-gray'>Roll #{s.get('rollNo')}</span> "
-                        f"<span class='chip {chip}'>{status}</span></div>"
-                        f"<div class='meta'>{s.get('email')} | 📍 {s.get('location')} | "
-                        f"<span class='chip chip-blue'>{domain_name}</span> "
-                        f"<span class='chip chip-gray'>{bc_name}</span></div>"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
-                if len(students) > 100:
-                    st.caption(f"Showing first 100 of {len(students)} students.")
+            search = st.text_input("🔎 Filter by name or roll no")
+            filtered = students
+            if search:
+                filtered = [s for s in students
+                            if search.lower() in str(s.get("name","")).lower()
+                            or search in str(s.get("rollNo",""))]
+
+            for s in filtered[:100]:
+                status = s.get("studentStatus", "")
+                chip = "chip-green" if status == "enrolled" else "chip-red"
+                domain_name = next((k for k,v in DOMAINS.items() if v == s.get("domainId","")), s.get("domainId",""))
+                bc_name     = next((k for k,v in BOOTCAMPS.items() if v == s.get("studentBootcampId","")), s.get("studentBootcampId",""))
+                st.markdown(
+                    f"<div class='card'>"
+                    f"<div class='title'>{s.get('name')} "
+                    f"<span class='chip chip-gray'>Roll #{s.get('rollNo')}</span> "
+                    f"<span class='chip {chip}'>{status}</span></div>"
+                    f"<div class='meta'>{s.get('email')} | 📍 {s.get('location')} | "
+                    f"<span class='chip chip-blue'>{domain_name}</span> "
+                    f"<span class='chip chip-gray'>{bc_name}</span></div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+            if len(filtered) > 100:
+                st.caption(f"Showing first 100 of {len(filtered)} students.")
 
     # ──────────────────────────────────────────
     # ASSIGNMENTS
@@ -719,6 +797,11 @@ if panel == "Admin":
                         f"</div>",
                         unsafe_allow_html=True
                     )
+                    notif_id = n.get("_id", {}).get("$oid") if isinstance(n.get("_id"), dict) else str(n.get("_id", ""))
+                    if st.button("Mark as Read", key=f"mark_admin_full_{notif_id}"):
+                        _, derr = delete(f"/notifications/{notif_id}")
+                        if derr: err(derr)
+                        else: st.rerun()
 
 
 # ═══════════════════════════════════════════════
@@ -731,7 +814,7 @@ elif panel == "Student":
         st.markdown("---")
         student_page = st.radio("Section", [
             " My Dashboard",
-            " Submit Assignment",
+            "📝 Submit Assignment",
             " My Notifications",
         ], label_visibility="collapsed")
 
@@ -781,6 +864,11 @@ elif panel == "Student":
                         f"</div>",
                         unsafe_allow_html=True
                     )
+                    notif_id = n.get("_id", {}).get("$oid") if isinstance(n.get("_id"), dict) else str(n.get("_id", ""))
+                    if st.button("Mark as Read", key=f"mark_stud_bar_{notif_id}"):
+                        _, derr = delete(f"/notifications/{notif_id}")
+                        if derr: err(derr)
+                        else: st.rerun()
 
         st.markdown("---")
 
@@ -944,6 +1032,11 @@ elif panel == "Student":
                             f"</div>",
                             unsafe_allow_html=True
                         )
+                        notif_id = n.get("_id", {}).get("$oid") if isinstance(n.get("_id"), dict) else str(n.get("_id", ""))
+                        if st.button("Mark as Read", key=f"mark_stud_full_{notif_id}"):
+                            _, derr = delete(f"/notifications/{notif_id}")
+                            if derr: err(derr)
+                            else: st.rerun()
 
     else:
         st.info(" Enter your roll number above and click **Load My Data** to get started.")
